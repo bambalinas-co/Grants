@@ -1,0 +1,34 @@
+# Guarda este archivo en tu repo de GitHub en la ruta exacta:
+#   .github/workflows/weekly-search.yml
+#
+# Corre automáticamente todos los lunes a las 8:00 am hora de Colombia.
+
+name: Barrido semanal de convocatorias
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"   # 13:00 UTC = 8:00 am Colombia (UTC-5), todos los lunes
+  workflow_dispatch: {}     # permite correrlo manualmente desde GitHub cuando quieras probarlo
+
+jobs:
+  buscar-y-enviar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar el repo
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install anthropic
+
+      - name: Correr la búsqueda y enviar el correo
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python weekly_search.py
