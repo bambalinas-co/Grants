@@ -86,6 +86,22 @@ Fuentes a revisar: YouthOp (youthop.com), OpportunitiesCorners
 (fundsforindividuals.fundsforngos.org). Busca fellowships de liderazgo,
 becas de posgrado o programas ejecutivos cortos, premios individuales.
 
+REGLA DURA SOBRE FECHAS — esto es crítico, léelo con cuidado:
+Antes de reportar cualquier fecha límite, verifica explícitamente en la
+fuente oficial (no en un agregador ni de memoria) si esa fecha ya pasó
+respecto a hoy ({today}). Nunca reportes una convocatoria cuya fecha límite
+ya pasó.
+Distingue estos tres casos con precisión:
+  - Si la fuente CONFIRMA explícitamente que no hay fecha límite fija
+    (programa permanente/continuo): deadline = "rolling", date_confidence = "verified".
+  - Si encontraste una fecha específica en la fuente oficial: deadline =
+    "YYYY-MM-DD", date_confidence = "verified".
+  - Si NO pudiste confirmar la fecha con certeza (la fuente no la menciona
+    claramente, o la información es de un agregador sin fecha verificable):
+    deadline = "unknown", date_confidence = "unverified". NO asumas
+    "rolling" solo porque no encontraste la fecha — eso es una suposición,
+    no una verificación.
+
 REGLA DURA: nunca incluyas préstamos, deuda, capital reembolsable, ni
 inversión de equity. Solo subvenciones no reembolsables (grants), becas,
 o premios.
@@ -100,7 +116,8 @@ Responde ÚNICAMENTE con un JSON válido (sin texto antes o después, sin
       "name": "nombre de la convocatoria",
       "org": "organización que la ofrece",
       "amount_usd": <número entero en USD, o null si no aplica/no se sabe>,
-      "deadline": "YYYY-MM-DD" o "rolling" si no tiene fecha fija,
+      "deadline": "YYYY-MM-DD", "rolling", o "unknown",
+      "date_confidence": "verified" o "unverified",
       "geography": "descripción breve del alcance geográfico",
       "type": "grant" | "fellowship" | "prize" | "other",
       "link": "URL oficial",
@@ -125,6 +142,7 @@ class Opportunity:
     org: str
     amount_usd: float | None
     deadline: str
+    date_confidence: str
     geography: str
     type: str
     link: str
@@ -140,7 +158,8 @@ class Opportunity:
             name=str(d.get("name", "Sin nombre")),
             org=str(d.get("org", "")),
             amount_usd=_safe_float(d.get("amount_usd")),
-            deadline=str(d.get("deadline") or "rolling"),
+            deadline=str(d.get("deadline") or "unknown"),
+            date_confidence=str(d.get("date_confidence") or "unverified"),
             geography=str(d.get("geography", "")),
             type=str(d.get("type", "grant")),
             link=str(d.get("link", "")),
@@ -207,7 +226,23 @@ def parse_opportunities(raw_text: str) -> list[Opportunity]:
 # ---------------------------------------------------------------------------
 def is_disqualified(opp: Opportunity) -> bool:
     haystack = f"{opp.name} {opp.type} {opp.summary}".lower()
-    return any(term in haystack for term in DISQUALIFYING_TERMS)
+    if any(term in haystack for term in DISQUALIFYING_TERMS):
+        return True
+    return is_expired(opp.deadline)
+
+
+def is_expired(deadline_str: str, today: date | None = None) -> bool:
+    """Una fecha ya pasada descalifica sin importar qué tan bien encaje —
+    a diferencia de la urgencia (que solo resta puntos), esto elimina."""
+    if today is None:
+        today = date.today()
+    if deadline_str == "rolling" or not deadline_str:
+        return False
+    try:
+        deadline = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return deadline < today
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +251,17 @@ def is_disqualified(opp: Opportunity) -> bool:
 def urgency_score(deadline_str: str, today: date) -> float:
     """Entre más cerca el plazo (sin haber pasado), más urgente — pero algo
     que cierra en menos de 2 días puntúa un poco menos porque probablemente
-    ya no da tiempo de armar una buena postulación."""
-    if deadline_str == "rolling" or not deadline_str:
-        return 5.0  # ni urgente ni descartable: siempre disponible
+    ya no da tiempo de armar una buena postulación.
+    'rolling' (confirmado sin fecha fija) puntúa neutral. 'unknown' (no se
+    pudo verificar) puntúa más bajo — la incertidumbre no debe premiarse."""
+    if deadline_str == "rolling":
+        return 5.0
+    if deadline_str == "unknown" or not deadline_str:
+        return 3.0
     try:
         deadline = datetime.strptime(deadline_str, "%Y-%m-%d").date()
     except ValueError:
-        return 5.0
+        return 3.0
 
     days_left = (deadline - today).days
     if days_left < 0:
@@ -265,7 +304,12 @@ def compute_composite(opp: Opportunity, today: date) -> float:
     urgency = urgency_score(opp.deadline, today)
     amount = amount_score(opp.amount_usd)
     geo = geo_score(opp.geography)
-    return round(0.40 * fit + 0.25 * urgency + 0.20 * amount + 0.15 * geo, 2)
+    raw = 0.40 * fit + 0.25 * urgency + 0.20 * amount + 0.15 * geo
+
+    # Penalización por baja confianza: una fecha no verificada no debe
+    # competir en igualdad de condiciones con una confirmada en la fuente.
+    confidence_multiplier = 1.0 if opp.date_confidence == "verified" else 0.85
+    return round(raw * confidence_multiplier, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -315,14 +359,17 @@ def score_bar(score: float) -> str:
 
 
 def render_opportunity(opp: Opportunity) -> str:
-    badge = '<span style="background:#2f6f4f;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">NUEVA</span>' if opp.is_new else '<span style="background:#b45309;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">CIERRA PRONTO</span>'
+    status_badge = '<span style="background:#2f6f4f;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">NUEVA</span>' if opp.is_new else '<span style="background:#b45309;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">CIERRA PRONTO</span>'
+    warning_badge = ""
+    if opp.date_confidence != "verified":
+        warning_badge = '&nbsp;<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">&#9888; FECHA SIN CONFIRMAR</span>'
     amount_text = f"${opp.amount_usd:,.0f} USD" if opp.amount_usd else "Monto no especificado"
     return f"""
     <tr>
       <td style="padding:14px 0;border-bottom:1px solid #e5e5e5;">
         <div style="font-size:15px;font-weight:600;color:#1a1a1a;">
           <a href="{opp.link}" style="color:#1a1a1a;text-decoration:none;">{opp.name}</a>
-          &nbsp;{badge}
+          &nbsp;{status_badge}{warning_badge}
         </div>
         <div style="font-size:13px;color:#555;margin-top:2px;">
           {opp.org} &middot; {amount_text} &middot; Cierra: {opp.deadline}
