@@ -2,6 +2,8 @@
 #   .github/workflows/weekly-search.yml
 #
 # Corre automáticamente todos los lunes a las 8:00 am hora de Colombia.
+# Después de correr, guarda su propia memoria (state.json) de vuelta al
+# repo, para no repetir la misma oportunidad cada semana.
 
 name: Barrido semanal de convocatorias
 
@@ -9,6 +11,9 @@ on:
   schedule:
     - cron: "0 13 * * 1"   # 13:00 UTC = 8:00 am Colombia (UTC-5), todos los lunes
   workflow_dispatch: {}     # permite correrlo manualmente desde GitHub cuando quieras probarlo
+
+permissions:
+  contents: write            # necesario para que el workflow pueda commitear state.json
 
 jobs:
   buscar-y-enviar:
@@ -32,3 +37,11 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python weekly_search.py
+
+      - name: Guardar la memoria (state.json) de vuelta al repo
+        run: |
+          git config user.name "bambalinas-grants-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Actualiza memoria del barrido semanal [skip ci]"
+          git push
