@@ -202,21 +202,21 @@ def call_claude_with_retries(client: anthropic.Anthropic, prompt: str) -> str:
 
 
 def parse_opportunities(raw_text: str) -> list[Opportunity]:
-    """Extrae el JSON de la respuesta, tolerando que venga envuelto en texto
-    o en fences de markdown pese a habérselo pedido explícitamente."""
+    """Extrae el JSON de la respuesta de forma robusta: usa raw_decode para
+    leer el primer objeto JSON válido e ignorar cualquier cosa que venga
+    después (explicaciones, fences de markdown, etc.) — a diferencia de
+    json.loads(), que falla entero si sobra aunque sea un carácter."""
     cleaned = raw_text.strip()
     cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
     cleaned = re.sub(r"```$", "", cleaned).strip()
 
-    # Si aún así hay texto antes/después del objeto JSON, recorta al primer
-    # '{' y al último '}' que hagan match razonable.
-    if not cleaned.startswith("{"):
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1:
-            cleaned = cleaned[start : end + 1]
+    start = cleaned.find("{")
+    if start == -1:
+        raise ValueError("La respuesta no contiene ningún objeto JSON reconocible")
 
-    data = json.loads(cleaned)
+    decoder = json.JSONDecoder()
+    data, _end_index = decoder.raw_decode(cleaned, idx=start)
+
     raw_opportunities = data.get("opportunities", [])
     return [Opportunity.from_dict(o) for o in raw_opportunities]
 
@@ -328,24 +328,45 @@ def save_state(state: dict[str, Any]) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
 
 
+REMINDER_INTERVAL_DAYS = 21  # cada cuánto recordar algo "rolling" que sigue vivo
+
+
 def apply_dedup(opportunities: list[Opportunity], state: dict[str, Any], today: date) -> list[Opportunity]:
     seen: dict[str, Any] = state.setdefault("seen", {})
     result: list[Opportunity] = []
 
     for opp in opportunities:
         key = opp.link or f"{opp.name}::{opp.org}"
-        previously_seen = key in seen
+        record = seen.get(key)
 
-        if previously_seen:
-            opp.is_new = False
-            deadline_soon = urgency_score(opp.deadline, today) >= 8.0
-            if not deadline_soon:
-                continue  # ya se reportó y no es urgente todavía: se omite
-        else:
+        if record is None:
+            # Nunca antes reportada: siempre se muestra.
             opp.is_new = True
-            seen[key] = {"first_seen": today.isoformat(), "name": opp.name}
+            seen[key] = {"first_seen": today.isoformat(), "last_shown": today.isoformat(), "name": opp.name}
+            result.append(opp)
+            continue
 
-        result.append(opp)
+        opp.is_new = False
+        deadline_soon = urgency_score(opp.deadline, today) >= 8.0
+
+        last_shown_str = record.get("last_shown", record.get("first_seen", today.isoformat()))
+        try:
+            last_shown = datetime.strptime(last_shown_str, "%Y-%m-%d").date()
+        except ValueError:
+            last_shown = today
+        days_since_shown = (today - last_shown).days
+
+        # Las de fecha fija ya se recuerdan solas por urgencia. Las "rolling"
+        # o "unknown" nunca suben de urgencia con el tiempo, así que sin este
+        # recordatorio periódico quedarían enterradas para siempre tras la
+        # primera vez que se reportan — eso fue exactamente lo que pasó la
+        # semana pasada.
+        is_evergreen = opp.deadline in ("rolling", "unknown")
+        periodic_reminder_due = is_evergreen and days_since_shown >= REMINDER_INTERVAL_DAYS
+
+        if deadline_soon or periodic_reminder_due:
+            record["last_shown"] = today.isoformat()
+            result.append(opp)
 
     return result
 
@@ -358,8 +379,13 @@ def score_bar(score: float) -> str:
     return "&#9632;" * filled + "&#9633;" * (10 - filled)  # ■■■□□□□□□□
 
 
-def render_opportunity(opp: Opportunity) -> str:
-    status_badge = '<span style="background:#2f6f4f;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">NUEVA</span>' if opp.is_new else '<span style="background:#b45309;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">CIERRA PRONTO</span>'
+def render_opportunity(opp: Opportunity, today: date) -> str:
+    if opp.is_new:
+        status_badge = '<span style="background:#2f6f4f;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">NUEVA</span>'
+    elif urgency_score(opp.deadline, today) >= 8.0 and opp.deadline not in ("rolling", "unknown"):
+        status_badge = '<span style="background:#b45309;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">CIERRA PRONTO</span>'
+    else:
+        status_badge = '<span style="background:#475569;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">SIGUE ABIERTA</span>'
     warning_badge = ""
     if opp.date_confidence != "verified":
         warning_badge = '&nbsp;<span style="background:#dc2626;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;">&#9888; FECHA SIN CONFIRMAR</span>'
@@ -383,10 +409,10 @@ def render_opportunity(opp: Opportunity) -> str:
     """
 
 
-def render_section(title: str, items: list[Opportunity]) -> str:
+def render_section(title: str, items: list[Opportunity], today: date) -> str:
     if not items:
         return f"<h2 style='font-family:sans-serif;color:#1a1a1a;'>{title}</h2><p style='font-family:sans-serif;color:#888;'>Nada nuevo ni urgente esta semana.</p>"
-    rows = "\n".join(render_opportunity(o) for o in items)
+    rows = "\n".join(render_opportunity(o, today) for o in items)
     return f"""
     <h2 style="font-family:sans-serif;color:#1a1a1a;border-bottom:2px solid #1a1a1a;padding-bottom:6px;">{title}</h2>
     <table style="width:100%;border-collapse:collapse;font-family:sans-serif;">{rows}</table>
@@ -397,12 +423,12 @@ def build_email_html(bambalinas: list[Opportunity], personal: list[Opportunity],
     return f"""
     <div style="max-width:640px;margin:0 auto;font-family:sans-serif;">
       <p style="color:#888;font-size:12px;">Barrido semanal &middot; {today.isoformat()}</p>
-      {render_section("Fundación Bambalinas Co.", bambalinas)}
-      {render_section("Oportunidades personales", personal)}
+      {render_section("Fundación Bambalinas Co.", bambalinas, today)}
+      {render_section("Oportunidades personales", personal, today)}
       <p style="color:#aaa;font-size:11px;margin-top:24px;">
-        Generado automáticamente. Los préstamos y capital reembolsable se filtran
-        siempre, sin excepción. El score combina encaje temático, urgencia,
-        tamaño del monto y alcance geográfico.
+        Generado automáticamente. Los préstamos, capital reembolsable y fechas
+        vencidas se filtran siempre. Las oportunidades sin fecha fija ("rolling")
+        se recuerdan cada {REMINDER_INTERVAL_DAYS} días mientras sigan vigentes.
       </p>
     </div>
     """
